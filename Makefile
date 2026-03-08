@@ -18,7 +18,7 @@ NVCCFLAGS := -std=$(CXX_STD) -arch=$(CUDA_ARCH) $(foreach option,$(NVCC_HOST_FLA
 LDFLAGS := -pthread -L$(CUDA_LIB_DIR)
 LDLIBS := -lstdc++ -lcudart -lm
 
-OBJECTS := $(OBJDIR)/main.o $(OBJDIR)/model.o $(OBJDIR)/tensor.o $(OBJDIR)/layer.o $(OBJDIR)/util.o
+OBJECTS := $(OBJDIR)/main.o $(OBJDIR)/model.o $(OBJDIR)/tensor.o $(OBJDIR)/layer.o $(OBJDIR)/util.o $(OBJDIR)/safetensors_loader.o
 
 all: $(TARGET)
 

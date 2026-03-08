@@ -1,49 +1,29 @@
 #include "model.h"
 
-#include <algorithm>
-#include <array>
-#include <cctype>
-#include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <string>
 #include <utility>
-#include <vector>
 
 #include "gpt2.h"
 #include "layer.h"
+#include "safetensors_loader.h"
 #include "util.h"
 
 namespace {
 
-struct TensorInfo {
-  std::string dtype;
-  std::vector<size_t> shape;
-  size_t begin = 0;
-  size_t end = 0;
-};
-
-struct BlockParameters {
-  Parameter *ln1_weight = nullptr;
-  Parameter *ln1_bias = nullptr;
-  Parameter *attn_c_attn_weight = nullptr;
-  Parameter *attn_c_attn_bias = nullptr;
-  Parameter *attn_c_proj_weight = nullptr;
-  Parameter *attn_c_proj_bias = nullptr;
-  Parameter *ln2_weight = nullptr;
-  Parameter *ln2_bias = nullptr;
-  Parameter *mlp_c_fc_weight = nullptr;
-  Parameter *mlp_c_fc_bias = nullptr;
-  Parameter *mlp_c_proj_weight = nullptr;
-  Parameter *mlp_c_proj_bias = nullptr;
-};
-
+/* [Model Parameters] */
 Parameter *wte_weight = nullptr;
 Parameter *wpe_weight = nullptr;
+Parameter *ln1_weight[N_LAYER], *ln1_bias[N_LAYER];
+Parameter *attn_c_attn_weight[N_LAYER], *attn_c_attn_bias[N_LAYER];
+Parameter *attn_c_proj_weight[N_LAYER], *attn_c_proj_bias[N_LAYER];
+Parameter *ln2_weight[N_LAYER], *ln2_bias[N_LAYER];
+Parameter *mlp_c_fc_weight[N_LAYER], *mlp_c_fc_bias[N_LAYER];
+Parameter *mlp_c_proj_weight[N_LAYER], *mlp_c_proj_bias[N_LAYER];
 Parameter *ln_f_weight = nullptr;
 Parameter *ln_f_bias = nullptr;
-BlockParameters blocks[N_LAYER];
 
+/* [Activations] */
 Activation *x = nullptr;
 Activation *residual = nullptr;
 Activation *ln_buf = nullptr;
@@ -69,202 +49,98 @@ void delete_tensor(Tensor *&tensor) {
   }
 }
 
-void skip_ws(const std::string &text, size_t *pos) {
-  while (*pos < text.size() &&
-         std::isspace(static_cast<unsigned char>(text[*pos]))) {
-    ++(*pos);
+template <size_t N>
+void delete_tensor_array(Tensor *(&tensors)[N]) {
+  for (size_t i = 0; i < N; ++i) {
+    delete_tensor(tensors[i]);
   }
 }
 
-std::string parse_quoted(const std::string &text, size_t *pos) {
-  skip_ws(text, pos);
-  CHECK_ERROR(*pos < text.size() && text[*pos] == '"',
-              "Invalid JSON string at offset %zu", *pos);
-  ++(*pos);
-  size_t start = *pos;
-  while (*pos < text.size() && text[*pos] != '"') {
-    CHECK_ERROR(text[*pos] != '\\', "Escaped JSON strings are not supported");
-    ++(*pos);
-  }
-  CHECK_ERROR(*pos < text.size(), "Unterminated JSON string");
-  std::string value = text.substr(start, *pos - start);
-  ++(*pos);
-  return value;
-}
-
-size_t parse_uint(const std::string &text, size_t *pos) {
-  skip_ws(text, pos);
-  CHECK_ERROR(*pos < text.size() &&
-                  std::isdigit(static_cast<unsigned char>(text[*pos])),
-              "Expected unsigned integer at offset %zu", *pos);
-  size_t value = 0;
-  while (*pos < text.size() &&
-         std::isdigit(static_cast<unsigned char>(text[*pos]))) {
-    value = value * 10 + (size_t)(text[*pos] - '0');
-    ++(*pos);
-  }
-  return value;
-}
-
-std::vector<size_t> parse_uint_array(const std::string &text, size_t *pos) {
-  skip_ws(text, pos);
-  CHECK_ERROR(*pos < text.size() && text[*pos] == '[',
-              "Expected array at offset %zu", *pos);
-  ++(*pos);
-
-  std::vector<size_t> values;
-  while (true) {
-    skip_ws(text, pos);
-    CHECK_ERROR(*pos < text.size(), "Unterminated array");
-    if (text[*pos] == ']') {
-      ++(*pos);
-      break;
-    }
-    values.push_back(parse_uint(text, pos));
-    skip_ws(text, pos);
-    CHECK_ERROR(*pos < text.size(), "Unterminated array");
-    if (text[*pos] == ',') {
-      ++(*pos);
-      continue;
-    }
-    CHECK_ERROR(text[*pos] == ']', "Expected ',' or ']' in array");
-  }
-  return values;
-}
-
-TensorInfo parse_tensor_info(const std::string &header, const std::string &name) {
-  std::string needle = "\"" + name + "\"";
-  size_t key_pos = header.find(needle);
-  CHECK_ERROR(key_pos != std::string::npos, "Missing tensor %s in safetensors",
-              name.c_str());
-
-  size_t pos = key_pos + needle.size();
-  skip_ws(header, &pos);
-  CHECK_ERROR(pos < header.size() && header[pos] == ':',
-              "Malformed tensor entry for %s", name.c_str());
-  ++pos;
-  skip_ws(header, &pos);
-  CHECK_ERROR(pos < header.size() && header[pos] == '{',
-              "Expected object for %s", name.c_str());
-  ++pos;
-
-  TensorInfo info;
-  while (true) {
-    skip_ws(header, &pos);
-    CHECK_ERROR(pos < header.size(), "Unterminated tensor object for %s",
-                name.c_str());
-    if (header[pos] == '}') {
-      ++pos;
-      break;
-    }
-
-    std::string field = parse_quoted(header, &pos);
-    skip_ws(header, &pos);
-    CHECK_ERROR(pos < header.size() && header[pos] == ':',
-                "Expected ':' in tensor object for %s", name.c_str());
-    ++pos;
-
-    if (field == "dtype") {
-      info.dtype = parse_quoted(header, &pos);
-    } else if (field == "shape") {
-      info.shape = parse_uint_array(header, &pos);
-    } else if (field == "data_offsets") {
-      std::vector<size_t> offsets = parse_uint_array(header, &pos);
-      CHECK_ERROR(offsets.size() == 2,
-                  "data_offsets must have size 2 for tensor %s", name.c_str());
-      info.begin = offsets[0];
-      info.end = offsets[1];
-    } else {
-      CHECK_ERROR(false, "Unsupported field %s while parsing %s", field.c_str(),
-                  name.c_str());
-    }
-
-    skip_ws(header, &pos);
-    CHECK_ERROR(pos < header.size(), "Unterminated tensor object for %s",
-                name.c_str());
-    if (header[pos] == ',') {
-      ++pos;
-    } else {
-      CHECK_ERROR(header[pos] == '}', "Malformed tensor object for %s",
-                  name.c_str());
-    }
-  }
-
-  CHECK_ERROR(info.dtype == "F32", "Tensor %s must be F32, got %s", name.c_str(),
-              info.dtype.c_str());
-  CHECK_ERROR(!info.shape.empty(), "Tensor %s has empty shape", name.c_str());
-  CHECK_ERROR(info.end >= info.begin, "Tensor %s has invalid offsets",
-              name.c_str());
-  return info;
-}
-
-Parameter *load_parameter(FILE *f, size_t data_base, const std::string &header,
-                          const std::string &name,
-                          const std::vector<size_t> &expected_shape) {
-  TensorInfo info = parse_tensor_info(header, name);
-  CHECK_ERROR(info.shape == expected_shape,
-              "Tensor %s shape mismatch while loading parameter", name.c_str());
-
-  size_t numel = 1;
-  for (size_t dim : info.shape) {
-    numel *= dim;
-  }
-  CHECK_ERROR((info.end - info.begin) == numel * sizeof(float),
-              "Tensor %s byte size mismatch", name.c_str());
-
-  Parameter *param = new Parameter(expected_shape);
-  CHECK_ERROR(fseek(f, (long)(data_base + info.begin), SEEK_SET) == 0,
-              "Failed to seek to tensor %s", name.c_str());
-  size_t ret = fread(param->buf, sizeof(float), numel, f);
-  CHECK_ERROR(ret == numel, "Failed to read tensor %s", name.c_str());
-  param->to_gpu();
-  return param;
-}
-
-void load_block_parameters(FILE *f, size_t data_base, const std::string &header,
-                           size_t layer_idx) {
+void load_transformer_block_parameters(SafetensorsLoader *loader,
+                                       size_t layer_idx) {
   std::string prefix = "h." + std::to_string(layer_idx) + ".";
-  BlockParameters &block = blocks[layer_idx];
 
-  block.ln1_weight =
-      load_parameter(f, data_base, header, prefix + "ln_1.weight", {C});
-  block.ln1_bias =
-      load_parameter(f, data_base, header, prefix + "ln_1.bias", {C});
-  block.attn_c_attn_weight = load_parameter(
-      f, data_base, header, prefix + "attn.c_attn.weight", {C, 3 * C});
-  block.attn_c_attn_bias =
-      load_parameter(f, data_base, header, prefix + "attn.c_attn.bias", {3 * C});
-  block.attn_c_proj_weight =
-      load_parameter(f, data_base, header, prefix + "attn.c_proj.weight", {C, C});
-  block.attn_c_proj_bias =
-      load_parameter(f, data_base, header, prefix + "attn.c_proj.bias", {C});
-  block.ln2_weight =
-      load_parameter(f, data_base, header, prefix + "ln_2.weight", {C});
-  block.ln2_bias =
-      load_parameter(f, data_base, header, prefix + "ln_2.bias", {C});
-  block.mlp_c_fc_weight = load_parameter(
-      f, data_base, header, prefix + "mlp.c_fc.weight", {C, MLP_DIM});
-  block.mlp_c_fc_bias =
-      load_parameter(f, data_base, header, prefix + "mlp.c_fc.bias", {MLP_DIM});
-  block.mlp_c_proj_weight = load_parameter(
-      f, data_base, header, prefix + "mlp.c_proj.weight", {MLP_DIM, C});
-  block.mlp_c_proj_bias =
-      load_parameter(f, data_base, header, prefix + "mlp.c_proj.bias", {C});
+  ln1_weight[layer_idx] =
+      loader->load_parameter((prefix + "ln_1.weight").c_str(), {C});
+  ln1_bias[layer_idx] =
+      loader->load_parameter((prefix + "ln_1.bias").c_str(), {C});
+  attn_c_attn_weight[layer_idx] =
+      loader->load_parameter((prefix + "attn.c_attn.weight").c_str(), {C, 3 * C});
+  attn_c_attn_bias[layer_idx] =
+      loader->load_parameter((prefix + "attn.c_attn.bias").c_str(), {3 * C});
+  attn_c_proj_weight[layer_idx] =
+      loader->load_parameter((prefix + "attn.c_proj.weight").c_str(), {C, C});
+  attn_c_proj_bias[layer_idx] =
+      loader->load_parameter((prefix + "attn.c_proj.bias").c_str(), {C});
+  ln2_weight[layer_idx] =
+      loader->load_parameter((prefix + "ln_2.weight").c_str(), {C});
+  ln2_bias[layer_idx] =
+      loader->load_parameter((prefix + "ln_2.bias").c_str(), {C});
+  mlp_c_fc_weight[layer_idx] =
+      loader->load_parameter((prefix + "mlp.c_fc.weight").c_str(), {C, MLP_DIM});
+  mlp_c_fc_bias[layer_idx] =
+      loader->load_parameter((prefix + "mlp.c_fc.bias").c_str(), {MLP_DIM});
+  mlp_c_proj_weight[layer_idx] =
+      loader->load_parameter((prefix + "mlp.c_proj.weight").c_str(), {MLP_DIM, C});
+  mlp_c_proj_bias[layer_idx] =
+      loader->load_parameter((prefix + "mlp.c_proj.bias").c_str(), {C});
 }
 
-void free_block_parameters(BlockParameters &block) {
-  delete_tensor(block.ln1_weight);
-  delete_tensor(block.ln1_bias);
-  delete_tensor(block.attn_c_attn_weight);
-  delete_tensor(block.attn_c_attn_bias);
-  delete_tensor(block.attn_c_proj_weight);
-  delete_tensor(block.attn_c_proj_bias);
-  delete_tensor(block.ln2_weight);
-  delete_tensor(block.ln2_bias);
-  delete_tensor(block.mlp_c_fc_weight);
-  delete_tensor(block.mlp_c_fc_bias);
-  delete_tensor(block.mlp_c_proj_weight);
-  delete_tensor(block.mlp_c_proj_bias);
+void alloc_and_set_parameters(const char *safetensors_path) {
+  SafetensorsLoader loader(safetensors_path);
+
+  wte_weight = loader.load_parameter("wte.weight", {VOCAB_SIZE, C});
+  wpe_weight = loader.load_parameter("wpe.weight", {MAX_T, C});
+
+  for (size_t layer = 0; layer < N_LAYER; ++layer) {
+    load_transformer_block_parameters(&loader, layer);
+  }
+
+  ln_f_weight = loader.load_parameter("ln_f.weight", {C});
+  ln_f_bias = loader.load_parameter("ln_f.bias", {C});
+}
+
+void free_parameters() {
+  delete_tensor(wte_weight);
+  delete_tensor(wpe_weight);
+  delete_tensor_array(ln1_weight);
+  delete_tensor_array(ln1_bias);
+  delete_tensor_array(attn_c_attn_weight);
+  delete_tensor_array(attn_c_attn_bias);
+  delete_tensor_array(attn_c_proj_weight);
+  delete_tensor_array(attn_c_proj_bias);
+  delete_tensor_array(ln2_weight);
+  delete_tensor_array(ln2_bias);
+  delete_tensor_array(mlp_c_fc_weight);
+  delete_tensor_array(mlp_c_fc_bias);
+  delete_tensor_array(mlp_c_proj_weight);
+  delete_tensor_array(mlp_c_proj_bias);
+  delete_tensor(ln_f_weight);
+  delete_tensor(ln_f_bias);
+}
+
+void transformer_block(size_t layer_idx) {
+  LayerNorm(x, ln1_weight[layer_idx], ln1_bias[layer_idx], ln_buf, LN_EPS);
+  Linear(ln_buf, attn_c_attn_weight[layer_idx], attn_c_attn_bias[layer_idx],
+         qkv);
+  SplitQKV(qkv, q, k, v);
+  AttentionScores(q, k, att_scores);
+  ScaleMaskSoftmax(att_scores, att_probs);
+  AttentionContext(att_probs, v, context);
+  MergeHeads(context, merged);
+  Linear(merged, attn_c_proj_weight[layer_idx], attn_c_proj_bias[layer_idx],
+         attn_proj);
+  ResidualAdd(x, attn_proj, residual);
+  std::swap(x, residual);
+
+  LayerNorm(x, ln2_weight[layer_idx], ln2_bias[layer_idx], ln_buf, LN_EPS);
+  Linear(ln_buf, mlp_c_fc_weight[layer_idx], mlp_c_fc_bias[layer_idx],
+         mlp_hidden);
+  GELUNew(mlp_hidden);
+  Linear(mlp_hidden, mlp_c_proj_weight[layer_idx], mlp_c_proj_bias[layer_idx],
+         mlp_out);
+  ResidualAdd(x, mlp_out, residual);
+  std::swap(x, residual);
 }
 
 void gpt2_forward_cpu(TokenBatch *tokens, Tensor *logits) {
@@ -277,25 +153,7 @@ void gpt2_forward_cpu(TokenBatch *tokens, Tensor *logits) {
   EmbeddingPositionAdd(tokens, wte_weight, wpe_weight, x);
 
   for (size_t layer = 0; layer < N_LAYER; ++layer) {
-    BlockParameters &block = blocks[layer];
-
-    LayerNorm(x, block.ln1_weight, block.ln1_bias, ln_buf, LN_EPS);
-    Linear(ln_buf, block.attn_c_attn_weight, block.attn_c_attn_bias, qkv);
-    SplitQKV(qkv, q, k, v);
-    AttentionScores(q, k, att_scores);
-    ScaleMaskSoftmax(att_scores, att_probs);
-    AttentionContext(att_probs, v, context);
-    MergeHeads(context, merged);
-    Linear(merged, block.attn_c_proj_weight, block.attn_c_proj_bias, attn_proj);
-    ResidualAdd(x, attn_proj, residual);
-    std::swap(x, residual);
-
-    LayerNorm(x, block.ln2_weight, block.ln2_bias, ln_buf, LN_EPS);
-    Linear(ln_buf, block.mlp_c_fc_weight, block.mlp_c_fc_bias, mlp_hidden);
-    GELUNew(mlp_hidden);
-    Linear(mlp_hidden, block.mlp_c_proj_weight, block.mlp_c_proj_bias, mlp_out);
-    ResidualAdd(x, mlp_out, residual);
-    std::swap(x, residual);
+    transformer_block(layer);
   }
 
   LayerNorm(x, ln_f_weight, ln_f_bias, ln_buf, LN_EPS);
@@ -330,28 +188,7 @@ TokenBatch load_tokens(const char *path) {
 }
 
 void initialize_model(const char *safetensors_path) {
-  FILE *f = fopen(safetensors_path, "rb");
-  CHECK_ERROR(f != nullptr, "Failed to open model file %s", safetensors_path);
-
-  uint64_t header_len = 0;
-  CHECK_ERROR(fread(&header_len, sizeof(uint64_t), 1, f) == 1,
-              "Failed to read safetensors header length");
-
-  std::string header(header_len, '\0');
-  CHECK_ERROR(fread(&header[0], 1, header_len, f) == header_len,
-              "Failed to read safetensors header");
-
-  size_t data_base = sizeof(uint64_t) + (size_t)header_len;
-
-  wte_weight = load_parameter(f, data_base, header, "wte.weight", {VOCAB_SIZE, C});
-  wpe_weight = load_parameter(f, data_base, header, "wpe.weight", {MAX_T, C});
-  for (size_t layer = 0; layer < N_LAYER; ++layer) {
-    load_block_parameters(f, data_base, header, layer);
-  }
-  ln_f_weight = load_parameter(f, data_base, header, "ln_f.weight", {C});
-  ln_f_bias = load_parameter(f, data_base, header, "ln_f.bias", {C});
-
-  fclose(f);
+  alloc_and_set_parameters(safetensors_path);
 }
 
 void alloc_activations(size_t batch_size, size_t seq_len) {
@@ -404,13 +241,7 @@ void validate_against_cpu(TokenBatch *tokens, Tensor *logits_gpu) {
 }
 
 void finalize_model() {
-  delete_tensor(wte_weight);
-  delete_tensor(wpe_weight);
-  for (size_t layer = 0; layer < N_LAYER; ++layer) {
-    free_block_parameters(blocks[layer]);
-  }
-  delete_tensor(ln_f_weight);
-  delete_tensor(ln_f_bias);
+  free_parameters();
 }
 
 void free_activations() {
