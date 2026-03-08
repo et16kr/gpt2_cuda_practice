@@ -42,12 +42,30 @@ void EmbeddingPositionAdd(TokenBatch *tokens, Tensor *wte, Tensor *wpe,
   }
 }
 
-void EmbeddingPositionAdd_gpu(TokenBatch *tokens, Tensor *wte, Tensor *wpe,
-                              Tensor *output) {
-  EmbeddingPositionAdd(tokens, wte, wpe, output);
+__global__ void embedding_position_add_kernel(int* input_ids, float* wte, float* wpe, float* output, size_t vocab_size) {
+  size_t S = gridDim.y;
+  size_t H = blockDim.x;
+  size_t b = blockIdx.x;
+  size_t s = blockIdx.y;
+  size_t h = threadIdx.x;
 
-  // TODO(student): Move token ids and embedding tables to GPU and replace the
-  // CPU reference loop with a CUDA kernel.
+  size_t idx = input_ids[b * S + s];
+  if (idx >= vocab_size)  return;
+  output[(b * S * H) + (s * H) + h] = wte[idx * H + h] + wpe[s * H + h];
+}
+
+void EmbeddingPositionAdd_gpu(TokenBatch *tokens, Tensor *wte, Tensor *wpe,
+                              Tensor *output) {  
+  size_t batch_size  = tokens->B;
+  size_t sequence    = tokens->T;
+  size_t hidden_size = C;
+  size_t vocab_size  = wte->shape[0];
+  
+  dim3 gridDim(batch_size, sequence);
+  dim3 blockDim(hidden_size);
+
+  embedding_position_add_kernel<<<gridDim, blockDim>>>(tokens->gpu_buf, wte->gpu_buf, wpe->gpu_buf, output->gpu_buf, vocab_size);
+
   CHECK_CUDA(cudaDeviceSynchronize());
 }
 
@@ -83,11 +101,48 @@ void LayerNorm(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
   }
 }
 
+__global__ void layer_norm_kernel(float* input, float* weight, float* bias, float* output, float eps) {
+  size_t cols = blockDim.x;
+  size_t row = blockIdx.x;
+  size_t col = threadIdx.x;
+  const float *in = input + row * cols;
+  float *out = output + row * cols;
+  __shared__ float L[1024];
+  __shared__ float L2[1024];
+
+  L[col] = in[col];
+  L2[col] = in[col]*in[col];
+
+  __syncthreads();
+  
+  if (col < (cols - 512)) {
+    L[col] += L[col+512];
+    L2[col] += L2[col+512];
+  }
+  __syncthreads();
+  for (int i = 256; i > 0 ; i /= 2) {
+    if (col < i) {
+      L[col] += L[col+i];
+      L2[col] += L2[col+i];
+    }
+    __syncthreads();
+  }
+
+  float mean = L[0]/cols;
+  float var = L2[0]/cols - mean * mean;
+
+  float inv_std = rsqrtf(var + eps);
+  out[col] = (in[col] - mean) * inv_std * weight[col] + bias[col];
+}
+
 void LayerNorm_gpu(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
                    float eps) {
-  LayerNorm(input, weight, bias, output, eps);
+  size_t rows = flat_rows(input);
+  size_t cols = last_dim(input);
 
-  // TODO(student): Implement row-wise mean/variance reduction on GPU.
+  dim3 gridDim(rows);
+  dim3 blockDim(cols);
+  layer_norm_kernel<<<gridDim, blockDim>>>(input->gpu_buf, weight->gpu_buf, bias->gpu_buf, output->gpu_buf, eps);
   CHECK_CUDA(cudaDeviceSynchronize());
 }
 

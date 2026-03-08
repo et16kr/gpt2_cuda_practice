@@ -143,6 +143,29 @@ void transformer_block(size_t layer_idx) {
   std::swap(x, residual);
 }
 
+void transformer_block_gpu(size_t layer_idx) {
+  LayerNorm_gpu(x, ln1_weight[layer_idx], ln1_bias[layer_idx], ln_buf, LN_EPS);
+  Linear_gpu(ln_buf, attn_c_attn_weight[layer_idx], attn_c_attn_bias[layer_idx], qkv);
+  SplitQKV_gpu(qkv, q, k, v);
+  AttentionScores_gpu(q, k, att_scores);
+  ScaleMaskSoftmax_gpu(att_scores, att_probs);
+  AttentionContext_gpu(att_probs, v, context);
+  MergeHeads_gpu(context, merged);
+  Linear_gpu(merged, attn_c_proj_weight[layer_idx], attn_c_proj_bias[layer_idx],
+         attn_proj);
+  ResidualAdd_gpu(x, attn_proj, residual);
+  std::swap(x, residual);
+
+  LayerNorm_gpu(x, ln2_weight[layer_idx], ln2_bias[layer_idx], ln_buf, LN_EPS);
+  Linear_gpu(ln_buf, mlp_c_fc_weight[layer_idx], mlp_c_fc_bias[layer_idx],
+         mlp_hidden);
+  GELUNew_gpu(mlp_hidden);
+  Linear_gpu(mlp_hidden, mlp_c_proj_weight[layer_idx], mlp_c_proj_bias[layer_idx],
+         mlp_out);
+  ResidualAdd_gpu(x, mlp_out, residual);
+  std::swap(x, residual);
+}
+
 void gpt2_forward_cpu(TokenBatch *tokens, Tensor *logits) {
   CHECK_ERROR(tokens->B == current_batch && tokens->T == current_seq,
               "Token batch shape differs from allocated activations");
@@ -158,6 +181,23 @@ void gpt2_forward_cpu(TokenBatch *tokens, Tensor *logits) {
 
   LayerNorm(x, ln_f_weight, ln_f_bias, ln_buf, LN_EPS);
   LMHead(ln_buf, wte_weight, logits);
+}
+
+void gpt2_forward_gpu(TokenBatch *tokens, Tensor *logits) {
+  CHECK_ERROR(tokens->B == current_batch && tokens->T == current_seq,
+              "Token batch shape differs from allocated activations");
+  CHECK_ERROR(logits->shape[0] == tokens->B && logits->shape[1] == tokens->T &&
+                  logits->shape[2] == VOCAB_SIZE,
+              "Logits tensor shape mismatch");
+
+  EmbeddingPositionAdd_gpu(tokens, wte_weight, wpe_weight, x);
+
+  for (size_t layer = 0; layer < N_LAYER; ++layer) {
+    transformer_block_gpu(layer);
+  }
+
+  LayerNorm_gpu(x, ln_f_weight, ln_f_bias, ln_buf, LN_EPS);
+  LMHead_gpu(ln_buf, wte_weight, logits);
 }
 
 }  // namespace
@@ -217,7 +257,7 @@ void alloc_activations(size_t batch_size, size_t seq_len) {
 }
 
 void gpt2_forward(TokenBatch *tokens, Tensor *logits) {
-  gpt2_forward_cpu(tokens, logits);
+  gpt2_forward_gpu(tokens, logits);
 
   // TODO(student): Replace the CPU path with GPU kernels layer by layer.
   CHECK_CUDA(cudaDeviceSynchronize());
