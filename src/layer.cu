@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <iostream>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -168,11 +169,41 @@ void Linear(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output) {
   }
 }
 
-void Linear_gpu(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output) {
-  Linear(input, weight, bias, output);
+__global__ void linear_kernel(float* input, float* weight, float* bias, float* output, size_t in_dim) {
+  size_t out_dim = gridDim.y;
+  size_t row = blockIdx.x;
+  size_t col = blockIdx.y;
+  size_t idx = threadIdx.x;
+  size_t block_size = blockDim.x;
+  __shared__ float L[1024];
+  const float *in = input + row * in_dim;
+  float *out = output + row * out_dim;
 
-  // TODO(student): Replace the CPU reference GEMM with CUDA kernel(s) or
-  // cuBLAS while keeping the same tensor layout.
+  float sum = 0.0;
+  for (int k = idx ; k < in_dim ; k += block_size) {
+    sum += in[k] * weight[k * out_dim + col];
+  }
+  L[idx] = sum;
+  __syncthreads();
+  for (int i = 512 ; i > 0 ; i/=2 ) {
+    if (idx < i) L[idx] += L[idx+i];
+    __syncthreads();
+  }
+  if (idx == 0) out[col] = L[0] + bias[col];
+}
+
+void Linear_gpu(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output) {
+  size_t rows = flat_rows(input);
+  size_t in_dim = last_dim(input);
+  size_t out_dim = weight->shape[1];
+  CHECK_ERROR(weight->shape[0] == in_dim, "Linear input dim mismatch");
+  CHECK_ERROR(bias->shape[0] == out_dim, "Linear bias dim mismatch");
+  CHECK_ERROR(output->num_elem() == rows * out_dim, "Linear output shape mismatch");
+
+  dim3 gridDim(rows, out_dim);
+  dim3 blockDim(1024);
+  linear_kernel<<<gridDim, blockDim>>>(input->gpu_buf, weight->gpu_buf, bias->gpu_buf, output->gpu_buf, in_dim);
+
   CHECK_CUDA(cudaDeviceSynchronize());
 }
 
@@ -197,10 +228,27 @@ void SplitQKV(Tensor *qkv, Tensor *q, Tensor *k, Tensor *v) {
   }
 }
 
-void SplitQKV_gpu(Tensor *qkv, Tensor *q, Tensor *k, Tensor *v) {
-  SplitQKV(qkv, q, k, v);
+__global__ void split_qkv_kernel(float* qkv, float* q, float* k, float* v) {
+  size_t T = gridDim.x;
+  size_t b = blockIdx.y;
+  size_t t = blockIdx.x;
+  size_t h = threadIdx.y;
+  size_t d = threadIdx.x;
+  qkv += (b * T + t) * (3 * C) + h * HEAD_DIM;
+  const size_t dst_base = ((b * N_HEAD + h) * T + t) * HEAD_DIM;
+  q[dst_base + d] = qkv[d];
+  k[dst_base + d] = qkv[C + d];
+  v[dst_base + d] = qkv[2 * C + d];
+}
 
-  // TODO(student): Implement a layout transform kernel for q/k/v split.
+void SplitQKV_gpu(Tensor *qkv, Tensor *q, Tensor *k, Tensor *v) {
+  const size_t B = qkv->shape[0];
+  const size_t T = qkv->shape[1];
+  CHECK_ERROR(qkv->shape[2] == 3 * C, "QKV input size mismatch");
+
+  dim3 gridDim(T, B);
+  dim3 blockDim(HEAD_DIM, N_HEAD);
+  split_qkv_kernel<<<gridDim, blockDim>>>(qkv->gpu_buf, q->gpu_buf, k->gpu_buf, v->gpu_buf);
   CHECK_CUDA(cudaDeviceSynchronize());
 }
 
@@ -229,10 +277,32 @@ void AttentionScores(Tensor *q, Tensor *k, Tensor *scores) {
   }
 }
 
-void AttentionScores_gpu(Tensor *q, Tensor *k, Tensor *scores) {
-  AttentionScores(q, k, scores);
+__global__ void attention_scores_kernel(float* q, float* k, float* scores, size_t D) {
+  size_t H = gridDim.x;
+  size_t T = blockDim.x;
+  size_t b = blockIdx.y;
+  size_t h = blockIdx.x;
+  size_t tk = threadIdx.x;
+  size_t tq = threadIdx.y;
 
-  // TODO(student): Replace the dot-product loops with a CUDA kernel.
+  scores += ((b * H + h) * T + tq) * T;
+  q += ((b * H + h) * T + tq) * D;
+  k += ((b * H + h) * T + tk) * D;
+  float sum = 0.0f;
+  for (size_t d = 0; d < D; ++d) {
+    sum += q[d] * k[d];
+  }
+  scores[tk] = sum;
+}
+void AttentionScores_gpu(Tensor *q, Tensor *k, Tensor *scores) {
+  const size_t B = q->shape[0];
+  const size_t H = q->shape[1];
+  const size_t T = q->shape[2];
+  const size_t D = q->shape[3];
+
+  dim3 gridDim(H,B);
+  dim3 blockDim(T,T);
+  attention_scores_kernel<<<gridDim, blockDim>>>(q->gpu_buf, k->gpu_buf, scores->gpu_buf, D);
   CHECK_CUDA(cudaDeviceSynchronize());
 }
 
@@ -331,10 +401,26 @@ void MergeHeads(Tensor *context, Tensor *merged) {
   }
 }
 
+__global__ void merge_heads_kernel(float* context, float* merged, size_t B, size_t H, size_t T, size_t D) {
+  size_t n = blockDim.x * blockIdx.x + threadIdx.x;
+  size_t N = B * H * T * D;
+  size_t b = n / (H * T * D);
+  size_t h = (n / (T * D)) % H;
+  size_t t = (n / D) % T;
+  size_t d = n % D;
+  if (n >= N) return ;
+  merged[(b * T * C) + (t * C ) + h * D + d] = context[n];
+}
 void MergeHeads_gpu(Tensor *context, Tensor *merged) {
-  MergeHeads(context, merged);
+  const size_t B = context->shape[0];
+  const size_t H = context->shape[1];
+  const size_t T = context->shape[2];
+  const size_t D = context->shape[3];
+  const size_t N = B * H * T * D; 
 
-  // TODO(student): Implement the head merge layout transform on GPU.
+  dim3 gridDim((N+1023)/1024);
+  dim3 blockDim(1024);
+  merge_heads_kernel<<<gridDim, blockDim>>>(context->gpu_buf, merged->gpu_buf, B, H, T, D);
   CHECK_CUDA(cudaDeviceSynchronize());
 }
 
@@ -342,17 +428,25 @@ void ResidualAdd(Tensor *input, Tensor *addend, Tensor *output) {
   CHECK_ERROR(input->num_elem() == addend->num_elem() &&
                   input->num_elem() == output->num_elem(),
               "ResidualAdd shape mismatch");
-
 #pragma omp parallel for
   for (size_t i = 0; i < input->num_elem(); ++i) {
     output->buf[i] = input->buf[i] + addend->buf[i];
   }
 }
 
+__global__ void residual_add_kernel(float* input, float* addend, float* output, size_t N) {
+  size_t n = blockDim.x * blockIdx.x + threadIdx.x;
+  if (n >= N) return;
+  output[n] = input[n] + addend[n];
+}
 void ResidualAdd_gpu(Tensor *input, Tensor *addend, Tensor *output) {
-  ResidualAdd(input, addend, output);
-
-  // TODO(student): Replace elementwise add with a CUDA kernel.
+  CHECK_ERROR(input->num_elem() == addend->num_elem() &&
+                  input->num_elem() == output->num_elem(),
+              "ResidualAdd shape mismatch");
+  size_t N = input->num_elem();
+  dim3 gridDim((N+1023)/1024);
+  dim3 blockDim(1024);
+  residual_add_kernel<<<gridDim, blockDim>>>(input->gpu_buf, addend->gpu_buf, output->gpu_buf, N);
   CHECK_CUDA(cudaDeviceSynchronize());
 }
 
@@ -368,10 +462,21 @@ void GELUNew(Tensor *inout) {
   }
 }
 
-void GELUNew_gpu(Tensor *inout) {
-  GELUNew(inout);
+__global__ void gelu_new_kernel(float* inout, float kAlpha, size_t N) {
+  size_t n = blockDim.x * blockIdx.x + threadIdx.x;
+  if (n >= N) return;
+  float x = inout[n];
+  float x3 = x * x * x;
+  inout[n] = 0.5f * x * (1.0f + tanhf(kAlpha * (x + 0.044715f * x3)));
+}
 
-  // TODO(student): Implement GPT-2 gelu_new activation on GPU.
+void GELUNew_gpu(Tensor *inout) {
+  const float kAlpha = sqrtf(2.0f / 3.14159265358979323846f);
+
+  size_t N = inout->num_elem();
+  dim3 gridDim((N+1023)/1024);
+  dim3 blockDim(1024);
+  gelu_new_kernel<<<gridDim, blockDim>>>(inout->gpu_buf, kAlpha, N);
   CHECK_CUDA(cudaDeviceSynchronize());
 }
 
@@ -399,9 +504,31 @@ void LMHead(Tensor *input, Tensor *embedding, Tensor *output) {
   }
 }
 
-void LMHead_gpu(Tensor *input, Tensor *embedding, Tensor *output) {
-  LMHead(input, embedding, output);
+__global__ void lmhead_kernel(float *input, float *embedding, float *output, size_t hidden) {
+  size_t vocab = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t row = blockIdx.y;
+  if (vocab >= VOCAB_SIZE) return; 
+  input += row * hidden;
+  output += row * VOCAB_SIZE;
+  embedding += vocab * hidden;
+  float sum = 0.0f;
+  for (size_t h = 0; h < hidden; ++h) {
+    sum += input[h] * embedding[h];
+  }
+  output[vocab] = sum;
+}
 
-  // TODO(student): Replace the vocab projection with GPU code.
+void LMHead_gpu(Tensor *input, Tensor *embedding, Tensor *output) {
+  size_t rows = flat_rows(input);
+  size_t hidden = last_dim(input);
+  CHECK_ERROR(hidden == C, "LMHead hidden size mismatch");
+  CHECK_ERROR(embedding->shape[0] == VOCAB_SIZE && embedding->shape[1] == C,
+              "Embedding table shape mismatch");
+  CHECK_ERROR(output->num_elem() == rows * VOCAB_SIZE,
+              "LMHead output shape mismatch");
+
+  dim3 gridDim((VOCAB_SIZE+1023)/1024, rows);
+  dim3 blockDim(1024);
+  lmhead_kernel<<<gridDim, blockDim>>>(input->gpu_buf, embedding->gpu_buf, output->gpu_buf, hidden);
   CHECK_CUDA(cudaDeviceSynchronize());
 }
