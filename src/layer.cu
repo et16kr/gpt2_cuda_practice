@@ -311,6 +311,7 @@ void ScaleMaskSoftmax(Tensor *scores, Tensor *probs) {
   const size_t H = scores->shape[1];
   const size_t T = scores->shape[2];
   const float scale = 1.0f / sqrtf((float)HEAD_DIM);
+  // B: 1, H: 12, T: 8
 
 #pragma omp parallel for collapse(3)
   for (size_t b = 0; b < B; ++b) {
@@ -343,10 +344,47 @@ void ScaleMaskSoftmax(Tensor *scores, Tensor *probs) {
   }
 }
 
-void ScaleMaskSoftmax_gpu(Tensor *scores, Tensor *probs) {
-  ScaleMaskSoftmax(scores, probs);
+__global__ void scale_mask_softmax_kernel(float* scores, float* probs, float scale) {
+  size_t H = blockDim.y;
+  size_t T = blockDim.x;
+  size_t b = blockIdx.x;
+  size_t h = threadIdx.y;
+  size_t tq = threadIdx.x;
+  const size_t row_base = ((b * H + h) * T + tq) * T;
+  scores += row_base;
+  probs += row_base;
+  float row_max = -1e30f;
+  for (size_t tk = 0; tk <= tq; ++tk) {
+    float value = scores[tk] * scale;
+    row_max = fmaxf(row_max, value);
+  }
 
-  // TODO(student): Fuse scaling, causal masking, and softmax on GPU.
+  float sum = 0.0f;
+  for (size_t tk = 0; tk < T; ++tk) {
+    if (tk > tq) {
+      probs[tk] = 0.0f;
+      continue;
+    }
+    float value = scores[tk] * scale;
+    float e = expf(value - row_max);
+    probs[tk] = e;
+    sum += e;
+  }
+
+  for (size_t tk = 0; tk <= tq; ++tk) {
+    probs[tk] /= sum;
+  }
+}
+
+void ScaleMaskSoftmax_gpu(Tensor *scores, Tensor *probs) {
+  // B: 1, H: 12, T: 8
+  const size_t B = scores->shape[0];
+  const size_t H = scores->shape[1];
+  const size_t T = scores->shape[2];
+  const float scale = 1.0f / sqrtf((float)HEAD_DIM);
+  dim3 gridDim(B);
+  dim3 blockDim(T, H);
+  scale_mask_softmax_kernel<<<gridDim, blockDim>>>(scores->gpu_buf, probs->gpu_buf, scale);
   CHECK_CUDA(cudaDeviceSynchronize());
 }
 
@@ -375,10 +413,36 @@ void AttentionContext(Tensor *probs, Tensor *v, Tensor *context) {
   }
 }
 
+__global__ void attention_context_kernel(float* probs, float* v, float* context) {
+  size_t H = gridDim.x;
+  size_t T = blockDim.y;
+  size_t D = blockDim.x;
+  size_t d = threadIdx.x;
+  size_t tq = threadIdx.y;
+  size_t h = blockIdx.x;
+  size_t b = blockIdx.y;
+  probs += ((b * H + h) * T + tq) * T;
+  float sum = 0.0f;
+  for (size_t tk = 0; tk < T; ++tk) {
+    sum += probs[tk] * v[((b * H + h) * T + tk) * D + d];
+  }
+  context[((b * H + h) * T + tq) * D + d] = sum;
+}
+/*
+B: 1
+H: 12
+T: 8
+D: 64
+*/
 void AttentionContext_gpu(Tensor *probs, Tensor *v, Tensor *context) {
-  AttentionContext(probs, v, context);
+  const size_t B = probs->shape[0];
+  const size_t H = probs->shape[1];
+  const size_t T = probs->shape[2];
+  const size_t D = v->shape[3];
 
-  // TODO(student): Implement the weighted value accumulation on GPU.
+  dim3 gridDim(H,B);
+  dim3 blockDim(D,T);
+  attention_context_kernel<<<gridDim, blockDim>>>(probs->gpu_buf, v->gpu_buf, context->gpu_buf);
   CHECK_CUDA(cudaDeviceSynchronize());
 }
 

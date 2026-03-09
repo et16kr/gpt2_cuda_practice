@@ -94,6 +94,7 @@ int main(int argc, char **argv) {
   gpt2_forward(&tokens, &logits);
   double et = get_time();
   printf("Done!\n");
+  logits.to_cpu();
 
   double elapsed = et - st;
   printf("Elapsed time: %.6f sec\n", elapsed);
