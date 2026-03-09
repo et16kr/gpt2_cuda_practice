@@ -10,7 +10,6 @@ CUDA 연습용 GPT-2 inference 프로젝트입니다.
 
 ## 참고
 
-- 참고한 학습 방식: 서울대학교 천둥연구소 가속기 학교 과정의 CUDA 실습 프로젝트
 - 사용 모델: Hugging Face `openai-community/gpt2`
 - 모델 링크: `https://huggingface.co/openai-community/gpt2`
 
